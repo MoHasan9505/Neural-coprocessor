@@ -294,6 +294,13 @@ namespace
 //   1      no attempt succeeded
 //   2      a crash inside NGX ended the ladder
 //   3      the check could not start (devices, modules, exports)
+//   5      NGX was not usable in this process, so no attempt reached
+//          CreateFeature. This is about the check, not the machine: the
+//          parent starts a fresh process and tries again. Measured on a
+//          healthy rig 2026-09-29: once the first Init in a cold process
+//          leaves GetCapabilityParameters at FAIL_NotInitialized, every later
+//          attempt in that process does too, new devices included, while a
+//          fresh process has come up clean.
 extern "C" __declspec(dllexport)
 int nrcheck_run(int case_id, int neural_index, int other_index,
                 const wchar_t *snippet_path, const wchar_t *log_path)
@@ -358,6 +365,7 @@ int nrcheck_run(int case_id, int neural_index, int other_index,
 
     ID3D12Device *dev = devs[0];
     NVSDK_NGX_Parameter *params = nullptr;
+    bool reached_create = false;   // only attempts that called CreateFeature count
     for (int k = 1; k <= 8; ++k)
     {
         out("");
@@ -399,8 +407,18 @@ int nrcheck_run(int case_id, int neural_index, int other_index,
         if (params == nullptr)
         {
             out("  no parameter block - this attempt could not arm");
+            if (!reached_create)
+            {
+                // Nothing in this process has reached CreateFeature, and the
+                // measurement above says nothing later in it will. Hand back
+                // to the parent for a fresh process instead of burning the
+                // ladder on setup.
+                out("SETUP: NGX not usable in this process - CreateFeature never reached");
+                return 5;
+            }
             continue;
         }
+        reached_create = true;
 
         unsigned long seh = 0;
         const NVSDK_NGX_Result r = arm_once(n, dev, params, &seh);
@@ -417,7 +435,7 @@ int nrcheck_run(int case_id, int neural_index, int other_index,
             return (k == 1) ? 0 : 10 + k;
         }
     }
-    out("RESULT: NOT HEALED - no attempt succeeded");
+    out("RESULT: NOT HEALED - CreateFeature was reached and failed on every attempt that reached it");
     (void)other;   // the game's device stays alive until the process exits
     return 1;
 }

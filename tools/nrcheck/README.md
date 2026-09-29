@@ -16,7 +16,7 @@ Use one of these:
 3. Right-click `Verify-NRCheck.ps1` > **Run with PowerShell**.
 4. Attach `nrcheck_results.zip` to your GitHub issue.
 
-If PowerShell refuses to run the script, open a terminal in the game folder and run `nrcheck.exe`. It writes `nrcheck_report.txt` and the `nvngx_*_case*_adapter*.log` files. Attach those instead.
+If PowerShell refuses to run the script, open a terminal in the game folder and run `nrcheck.exe`. It writes `nrcheck_report.txt` and the `nvngx_*_start*_adapter*.log` files. Attach those instead.
 
 ## What it tests
 

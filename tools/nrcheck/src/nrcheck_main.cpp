@@ -22,7 +22,13 @@ namespace
 {
     std::wstring g_dir;        // exe directory, with trailing backslash
     std::wstring g_report;     // report path
+    std::wstring g_details;    // where the children write; folded into the report at the end
+    std::string  g_head;       // header + summary: the top of the report
 
+    // The report is written ONCE, at the end, summary first and the NGX
+    // return codes after it under their own heading. A reader - or an AI fed
+    // the file - meets the verdict before any start-up code, and the codes
+    // are labelled as details rather than as findings.
     void say(const char *fmt, ...)
     {
         char buf[2048];
@@ -31,9 +37,31 @@ namespace
         vsnprintf(buf, sizeof buf, fmt, ap);
         va_end(ap);
         fputs(buf, stdout); fputc('\n', stdout); fflush(stdout);
+        g_head += buf;
+        g_head += "\n";
+    }
+
+    void write_report()
+    {
+        std::string details;
         FILE *f = nullptr;
-        if (_wfopen_s(&f, g_report.c_str(), L"a") == 0 && f != nullptr)
-        { fputs(buf, f); fputc('\n', f); fclose(f); }
+        if (_wfopen_s(&f, g_details.c_str(), L"rb") == 0 && f != nullptr)
+        {
+            char b[4096]; size_t n;
+            while ((n = fread(b, 1, sizeof b, f)) > 0) details.append(b, n);
+            fclose(f);
+        }
+        DeleteFileW(g_details.c_str());
+        if (_wfopen_s(&f, g_report.c_str(), L"wb") == 0 && f != nullptr)
+        {
+            fputs(g_head.c_str(), f);
+            fputs("\n==================== DETAILS ====================\n"
+                  "Everything below is the raw record of each try, including NGX start-up\n"
+                  "codes such as FAIL_OutOfDate. They are NOT the verdict - the summary\n"
+                  "above is. Only tries that reached CreateFeature count.\n\n", f);
+            fputs(details.c_str(), f);
+            fclose(f);
+        }
     }
 
     bool exists(const std::wstring &p)
@@ -102,7 +130,7 @@ namespace
         GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
         std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --case " + std::to_wstring(c) +
             L" --neural " + std::to_wstring(neural) + L" --other " + std::to_wstring(other) +
-            L" --snippet \"" + snip + L"\" --log \"" + g_report + L"\"";
+            L" --snippet \"" + snip + L"\" --log \"" + g_details + L"\"";
         std::vector<wchar_t> buf(cmd.begin(), cmd.end());
         buf.push_back(L'\0');
         STARTUPINFOW si{}; si.cb = sizeof si;
@@ -126,7 +154,7 @@ namespace
     // logs would survive. Each case's pair is renamed after it finishes.
     void keep_ngx_logs(int c, UINT adapter)
     {
-        const std::wstring tag = L"_case" + std::to_wstring(c) + L"_adapter" + std::to_wstring(adapter);
+        const std::wstring tag = L"_start" + std::to_wstring(c) + L"_adapter" + std::to_wstring(adapter);
         const std::wstring core = g_dir + L"nvngx.log";
         if (exists(core))
             MoveFileExW(core.c_str(), (g_dir + L"nvngx" + tag + L".log").c_str(), MOVEFILE_REPLACE_EXISTING);
@@ -136,7 +164,7 @@ namespace
         do
         {
             std::wstring n = fd.cFileName;
-            if (n.find(L"_case") != std::wstring::npos) continue;   // already kept
+            if (n.find(L"_start") != std::wstring::npos) continue;   // already kept
             std::wstring stem = n.substr(0, n.size() - 4);
             MoveFileExW((g_dir + n).c_str(), (g_dir + stem + tag + L".log").c_str(), MOVEFILE_REPLACE_EXISTING);
         } while (FindNextFileW(h, &fd));
@@ -184,6 +212,7 @@ int wmain(int argc, wchar_t **argv)
     g_dir = exe;
     g_dir.erase(g_dir.find_last_of(L'\\') + 1);
     g_report = g_dir + L"nrcheck_report.txt";
+    g_details = g_dir + L"nrcheck_details.tmp";
 
     for (int i = 1; i < argc; ++i)
         if (!wcscmp(argv[i], L"--case")) return child_main(argc, argv);
@@ -198,13 +227,15 @@ int wmain(int argc, wchar_t **argv)
     }
 
     DeleteFileW(g_report.c_str());
+    DeleteFileW(g_details.c_str());
     SYSTEMTIME t; GetLocalTime(&t);
-    say("MGPU Bridge NR check 3.0 - %04u-%02u-%02u %02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
+    say("MGPU Bridge NR check 3.1 - %04u-%02u-%02u %02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
 
     if (snip.empty())
     {
         say("nvngx_dlssnr.dll NOT FOUND. Put nrcheck.exe in the game folder beside the mgpu\\ "
             "folder, or run: nrcheck.exe --snippet \"C:\\path\\to\\nvngx_dlssnr.dll\"");
+        write_report();
         return 3;
     }
     say("nvngx_dlssnr.dll: %ls | version %s | %lld bytes", snip.c_str(),
@@ -214,46 +245,67 @@ int wmain(int argc, wchar_t **argv)
     for (const gpu &x : g)
         say("GPU adapter[%u] %ls | driver %s | luid %08lX-%08lX", x.index, x.name.c_str(),
             x.driver.c_str(), (unsigned long)x.luid.HighPart, (unsigned long)x.luid.LowPart);
-    if (g.empty()) { say("No NVIDIA GPU found."); return 3; }
+    if (g.empty()) { say("No NVIDIA GPU found."); write_report(); return 3; }
 
-    struct row { UINT idx; std::wstring name; int code; };
+    struct row { UINT idx; std::wstring name; int code; int setups; };
     std::vector<row> rows;
     const bool multi = g.size() > 1;
+    const int kSetupTries = 5;
     for (size_t i = 0; i < g.size(); ++i)
     {
         const UINT other = multi ? g[(i + 1) % g.size()].index : g[i].index;
-        say("");
-        const int code = run_child(multi ? 1 : 3, g[i].index, other, snip);
-        keep_ngx_logs(1, g[i].index);
-        rows.push_back({ g[i].index, g[i].name, code });
+        int code = 5, tries = 0;
+        // Code 5 means NGX was not usable in that process and nothing reached
+        // CreateFeature - a fact about the check's start-up, not about this
+        // machine. A fresh process is the thing that has cleared it.
+        while (code == 5 && tries < kSetupTries)
+        {
+            ++tries;
+            printf("\n");
+            code = run_child(multi ? 1 : 3, g[i].index, other, snip);
+            keep_ngx_logs(tries, g[i].index);
+        }
+        rows.push_back({ g[i].index, g[i].name, code, tries });
     }
 
     static const char *const kWhat[9] = {
-        "", "first arm",
-        "same NGX session, 2 s later, fresh command list",
-        "clean up, Init again, arm",
-        "clean up, Init again, arm - after 2 s",
-        "clean up, Init again, arm - after 4 s",
-        "clean up, Init again, arm - after 8 s",
-        "new device on the neural GPU (old one kept)",
-        "old neural devices released, new device" };
+        "", "first try",
+        "same NGX session, 2 s later",
+        "cleaned up and started NGX again",
+        "cleaned up and started NGX again, after 2 s",
+        "cleaned up and started NGX again, after 4 s",
+        "cleaned up and started NGX again, after 8 s",
+        "new device on this GPU",
+        "old devices released, new device on this GPU" };
 
     say("");
     say("==================== SUMMARY ====================");
+    say("Only tries that reached DLSS-NR creation (CreateFeature) count here.");
     for (const row &r : rows)
     {
         if (r.code == 0)
-            say("adapter[%u] %ls: PASS at attempt 1 - the first arm works.", r.idx, r.name.c_str());
+            say("adapter[%u] %ls: PASS - DLSS-NR was created on the first try.", r.idx, r.name.c_str());
         else if (r.code >= 12 && r.code <= 18)
-            say("adapter[%u] %ls: HEALED at attempt %d - %s.", r.idx, r.name.c_str(),
+            say("adapter[%u] %ls: HEALED - DLSS-NR was created on try %d (%s).", r.idx, r.name.c_str(),
                 r.code - 10, kWhat[r.code - 10]);
         else if (r.code == 1)
-            say("adapter[%u] %ls: NOT HEALED - all 8 attempts failed.", r.idx, r.name.c_str());
+            say("adapter[%u] %ls: NOT HEALED - DLSS-NR creation was reached and failed on every try.",
+                r.idx, r.name.c_str());
         else if (r.code == 2)
-            say("adapter[%u] %ls: CRASH inside NGX - ladder stopped.", r.idx, r.name.c_str());
+            say("adapter[%u] %ls: CRASH - NGX crashed during DLSS-NR creation. The check stopped.",
+                r.idx, r.name.c_str());
+        else if (r.code == 5)
+            say("adapter[%u] %ls: NOT REACHED - the check could not get far enough to try DLSS-NR "
+                "creation (%d attempts). This result says nothing about this PC.",
+                r.idx, r.name.c_str(), r.setups);
         else
-            say("adapter[%u] %ls: %s - see the lines above.", r.idx, r.name.c_str(), word(r.code));
+            say("adapter[%u] %ls: %s - the check could not run. See the details.",
+                r.idx, r.name.c_str(), word(r.code));
+        if (r.setups > 1 && r.code != 5)
+            say("  (the check needed %d start-ups to reach DLSS-NR creation; that is about the check, not this PC)",
+                r.setups);
     }
-    say("Please attach nrcheck_report.txt and the nvngx_*_case*_adapter*.log files to your GitHub issue.");
+    say("Please attach nrcheck_results.zip (or nrcheck_report.txt) to your GitHub issue.");
+    write_report();
     return 0;
 }

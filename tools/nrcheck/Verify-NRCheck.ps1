@@ -49,7 +49,7 @@ Add-Content $report "Windows: $($os.Caption) $($os.Version)"
 
 # One zip with the report and every per-case NGX log, so there is one file to attach.
 $zip = Join-Path $here 'nrcheck_results.zip'
-$files = @($report) + @(Get-ChildItem -Path $here -Filter 'nvngx*_case*_adapter*.log' | ForEach-Object { $_.FullName })
+$files = @($report) + @(Get-ChildItem -Path $here -Filter 'nvngx*_start*_adapter*.log' | ForEach-Object { $_.FullName })
 Compress-Archive -Path $files -DestinationPath $zip -Force
 
 Write-Host ''
