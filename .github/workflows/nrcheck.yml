@@ -1,0 +1,66 @@
+name: nrcheck (experimental)
+
+# Builds the standalone DLSS-NR check in tools/nrcheck. It does not build or
+# change the add-on; build.yml is untouched.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/nrcheck/**'
+      - '.github/workflows/nrcheck.yml'
+
+permissions:
+  contents: read
+
+env:
+  # Same NGX pin as build.yml, so the check and the add-on use the same headers.
+  NGX_SHA: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: tools/nrcheck
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch NVIDIA NGX headers at pinned SHA
+        shell: bash
+        run: |
+          mkdir -p _dl ext
+          curl -fsSL -o _dl/ngx.tar.gz "https://codeload.github.com/NVIDIA/DLSS/tar.gz/${NGX_SHA}"
+          tar -xzf _dl/ngx.tar.gz -C _dl --wildcards "*/include"
+          rm -rf ext/ngx
+          mv _dl/*/include ext/ngx
+          test -f ext/ngx/nvsdk_ngx.h
+          grep -rq 'NVSDK_NGX_Feature_Reserved18' ext/ngx
+
+      - name: Configure
+        run: cmake -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Verify the NGX caller name
+        shell: bash
+        run: |
+          test -f "build/Release/nvngx.dll_nrcheck.dll" || {
+            echo "::error::nvngx.dll_nrcheck.dll missing - NGX would refuse the caller with 0xBAD00002"
+            exit 1
+          }
+
+      - name: Stage
+        shell: bash
+        run: |
+          mkdir -p _deploy
+          cp build/Release/nrcheck.exe _deploy/
+          cp build/Release/nvngx.dll_nrcheck.dll _deploy/
+          cp Verify-NRCheck.ps1 _deploy/
+          cp README.md _deploy/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nrcheck-experimental
+          path: tools/nrcheck/_deploy/
