@@ -11,17 +11,25 @@
 // nrcheck.exe and only this DLL carries the name.
 //
 // WHAT IT DOES
-// It tests the two candidate fixes against the add-on's current behaviour.
-// One case per process, chosen by the caller (the case numbers are the
-// report's):
-//   case 1  CONTROL - what the add-on does today in a game: the other GPU's
-//           device exists first and stays alive, then the neural device.
-//           On an affected machine this is expected to FAIL.
-//   case 2  FIX A, EARLY DEVICE - the neural device is created FIRST, then
-//           the other GPU's device, both kept alive. This is the add-on
-//           creating its device at load, before the game creates its own.
-//   case 3  FIX B, SEPARATE PROCESS - the neural device alone in its process,
-//           which is what a helper process would have.
+// It runs the SELF-HEALING ARM the add-on would run, in a process shaped like
+// a game: the other GPU's device is created first and stays alive the whole
+// time (that is the game's device), then the neural device. The add-on can
+// arm at any point it chooses, so a failed create is not final: this cleans
+// up and arms again, one change per attempt, and stops at the first success.
+//
+//   attempt 1  first arm - what the add-on does today
+//   attempt 2  same NGX session, 2 s later, fresh command list
+//   attempt 3  clean up (release, DestroyParameters), Init again, arm
+//   attempt 4  as 3, after 2 s
+//   attempt 5  as 3, after 4 s
+//   attempt 6  as 3, after 8 s
+//   attempt 7  a NEW device on the neural GPU (old one kept), Init on it, arm
+//   attempt 8  old neural devices RELEASED, another new one, Init on it, arm
+//
+// The attempt that first succeeds is the shape the add-on's self-healing arm
+// needs. A crash inside NGX ends the ladder: the add-on never re-enters NGX
+// after a caught fault (V44), and neither does this.
+//
 // On the neural device it runs the add-on's startup probe (P1.0c) call for
 // call: core Init -> core GetCapabilityParameters -> snippet Init_Ext ->
 // snippet PopulateParameters_Impl -> Width/Height set -> snippet
@@ -177,191 +185,239 @@ namespace
     }
 }
 
-// Returns: 0 = CreateFeature succeeded, 1 = CreateFeature returned an error,
-// 2 = a crash inside NGX was caught, 3 = the check could not reach CreateFeature,
-// 4 = GetCapabilityParameters failed after both Inits (the arm stops there too).
+namespace
+{
+    struct ngx_api
+    {
+        pf_init init = nullptr;
+        pf_get_caps caps = nullptr;
+        pf_destroy destroy = nullptr;
+        pf_create create = nullptr;
+        pf_release release = nullptr;
+        pf_init_ext s_iext = nullptr;
+        pf_populate s_pop = nullptr;
+        wchar_t data_path[MAX_PATH] = {};
+        NVSDK_NGX_FeatureCommonInfo common{};
+    };
+
+    // Init -> GetCapabilityParameters -> snippet Init_Ext -> Populate -> sizes.
+    // Init in the add-on's order: once (probe); if not Success, once more on
+    // the same device (arm), result ignored (V31). FAIL_OutOfDate is not a gate.
+    NVSDK_NGX_Parameter *open_session(const ngx_api &n, ID3D12Device *dev)
+    {
+        NVSDK_NGX_Result r = n.init(0ULL, n.data_path, dev, &n.common, NVSDK_NGX_Version_API);
+        out("  core Init: 0x%08X (%s)", (unsigned)r, rname(r));
+        if (r != NVSDK_NGX_Result_Success)
+        {
+            r = n.init(0ULL, n.data_path, dev, &n.common, NVSDK_NGX_Version_API);
+            out("  core Init again (arm order, V31 - result ignored): 0x%08X (%s)", (unsigned)r, rname(r));
+        }
+        NVSDK_NGX_Parameter *params = nullptr;
+        r = n.caps(&params);
+        out("  GetCapabilityParameters: 0x%08X (%s)", (unsigned)r, rname(r));
+        if (r != NVSDK_NGX_Result_Success || params == nullptr) return nullptr;
+        if (n.s_iext != nullptr)
+        {
+            r = n.s_iext(0ULL, n.data_path, dev, NVSDK_NGX_Version_API, params);
+            out("  snippet Init_Ext: 0x%08X (%s)", (unsigned)r, rname(r));
+        }
+        if (n.s_pop != nullptr)
+        {
+            r = n.s_pop(params);
+            out("  snippet PopulateParameters_Impl: 0x%08X (%s)", (unsigned)r, rname(r));
+        }
+        const unsigned W = 1280, H = 720;
+        params->Set(NVSDK_NGX_Parameter_Width, W);
+        params->Set(NVSDK_NGX_Parameter_Height, H);
+        params->Set("DLSSNR.Width", W);
+        params->Set("DLSSNR.Height", H);
+        return params;
+    }
+
+    // One arm: fresh queue, allocator, list and fence on `dev`, CreateFeature,
+    // drain, release the handle. Returns the CreateFeature result, or
+    // SEH_FAULT with *seh set. Nothing NGX recorded is executed after a fault.
+    NVSDK_NGX_Result arm_once(const ngx_api &n, ID3D12Device *dev, NVSDK_NGX_Parameter *params,
+                              unsigned long *seh)
+    {
+        ID3D12CommandQueue *q = nullptr;
+        ID3D12CommandAllocator *al = nullptr;
+        ID3D12GraphicsCommandList *cl = nullptr;
+        ID3D12Fence *fe = nullptr;
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) ||
+            FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al))) ||
+            FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, IID_PPV_ARGS(&cl))) ||
+            FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fe))))
+        {
+            out("  D3D12 objects for the arm could not be created");
+            if (cl) cl->Release(); if (al) al->Release(); if (q) q->Release(); if (fe) fe->Release();
+            return NVSDK_NGX_Result_FAIL_PlatformError;
+        }
+
+        NVSDK_NGX_Handle *h = nullptr;
+        LARGE_INTEGER f{}, t0{}, t1{};
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+        const NVSDK_NGX_Result r = create_guarded(n.create, cl, params, &h, seh);
+        QueryPerformanceCounter(&t1);
+        if ((unsigned)r == SEH_FAULT)
+        {
+            out("  CreateFeature(Reserved18): CRASH INSIDE NGX (exception 0x%08lX)", *seh);
+            return r;   // deliberately leaked: nothing NGX touched is reused
+        }
+        out("  CreateFeature(Reserved18) 1280x720: 0x%08X (%s) handle=%p elapsed=%.0fms",
+            (unsigned)r, rname(r), (void *)h,
+            (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+
+        cl->Close();
+        ID3D12CommandList *ls[1] = { cl };
+        q->ExecuteCommandLists(1, ls);
+        q->Signal(fe, 1);
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (ev != nullptr && fe->GetCompletedValue() < 1)
+        {
+            fe->SetEventOnCompletion(1, ev);
+            WaitForSingleObject(ev, 10000);
+        }
+        if (ev != nullptr) CloseHandle(ev);
+        if (h != nullptr && n.release != nullptr) n.release(h);
+        cl->Release(); al->Release(); fe->Release(); q->Release();
+        return (r == NVSDK_NGX_Result_Success && h != nullptr) ? NVSDK_NGX_Result_Success : r;
+    }
+}
+
+// Exit codes the parent reads:
+//   0      attempt 1 succeeded - the first arm works on this GPU
+//   10+k   attempt k (2..8) was the first to succeed - the arm self-healed
+//   1      no attempt succeeded
+//   2      a crash inside NGX ended the ladder
+//   3      the check could not start (devices, modules, exports)
 extern "C" __declspec(dllexport)
 int nrcheck_run(int case_id, int neural_index, int other_index,
                 const wchar_t *snippet_path, const wchar_t *log_path)
 {
     if (log_path != nullptr && log_path[0] != L'\0') _wfopen_s(&g_out, log_path, L"a");
+    const bool two_gpus = (case_id == 1);   // 1 = other GPU present, 3 = neural GPU only
 
-    static const char *const kName[4] = {
-        "", "CONTROL (other GPU first - what the add-on does today)",
-        "FIX A (neural device first, then the other GPU)",
-        "FIX B (neural device alone - separate process)" };
-    out("---- case %d, neural adapter[%d]: %s ----", case_id, neural_index,
-        (case_id >= 1 && case_id <= 3) ? kName[case_id] : "?");
+    out("---- neural adapter[%d]: self-healing arm%s ----", neural_index,
+        two_gpus ? ", the other GPU's device created first and kept alive" : " (one GPU)");
 
-    // Both devices stay alive until the process exits, on purpose: the
-    // question is which device is FIRST in a process where both are live.
     ID3D12Device *other = nullptr;
-    ID3D12Device *dev = nullptr;
-    if (case_id == 1)
+    if (two_gpus)
     {
-        other = make_device((UINT)other_index, "first  (other)");
-        if (other == nullptr) { out("RESULT case %d: SKIPPED (no device on the other GPU)", case_id); return 3; }
-        dev = make_device((UINT)neural_index, "second (neural)");
+        other = make_device((UINT)other_index, "other (the game's)");
+        if (other == nullptr) { out("RESULT: SKIPPED (no device on the other GPU)"); return 3; }
     }
-    else if (case_id == 2)
-    {
-        dev = make_device((UINT)neural_index, "first  (neural)");
-        if (dev != nullptr)
-        {
-            other = make_device((UINT)other_index, "second (other)");
-            if (other == nullptr) { out("RESULT case %d: SKIPPED (no device on the other GPU)", case_id); return 3; }
-        }
-    }
-    else
-    {
-        dev = make_device((UINT)neural_index, "only   (neural)");
-    }
-    if (dev == nullptr) { out("RESULT case %d: SKIPPED (no device on the neural GPU)", case_id); return 3; }
+    ID3D12Device *devs[3] = {};
+    devs[0] = make_device((UINT)neural_index, "neural");
+    if (devs[0] == nullptr) { out("RESULT: SKIPPED (no device on the neural GPU)"); return 3; }
 
     HMODULE core = load_core();
     HMODULE snip = LoadLibraryW(snippet_path);
     out("snippet \"%ls\": %s", snippet_path, snip ? "loaded" : "NOT loaded");
-    if (core == nullptr || snip == nullptr) { out("RESULT case %d: SKIPPED (modules)", case_id); return 3; }
+    if (core == nullptr || snip == nullptr) { out("RESULT: SKIPPED (modules)"); return 3; }
 
-    // Same preferences as the add-on: Init/Caps/Destroy from the core,
-    // Create/Release from the snippet, snippet Init_Ext/Populate strictly
-    // from the snippet.
+    ngx_api n;
     const char *w1, *w2, *w3, *w4, *w5;
-    auto p_init   = (pf_init)    pick(core, snip, "NVSDK_NGX_D3D12_Init", &w1, "core", "snippet!FALLBACK");
-    auto p_caps   = (pf_get_caps)pick(core, snip, "NVSDK_NGX_D3D12_GetCapabilityParameters", &w2, "core", "snippet!FALLBACK");
-    auto p_dest   = (pf_destroy) pick(core, snip, "NVSDK_NGX_D3D12_DestroyParameters", &w3, "core", "snippet!FALLBACK");
-    auto p_create = (pf_create)  pick(snip, core, "NVSDK_NGX_D3D12_CreateFeature", &w4, "snippet", "core!FALLBACK");
-    auto p_rel    = (pf_release) pick(snip, core, "NVSDK_NGX_D3D12_ReleaseFeature", &w5, "snippet", "core!FALLBACK");
-    auto ps_iext  = (pf_init_ext)GetProcAddress(snip, "NVSDK_NGX_D3D12_Init_Ext");
-    auto ps_pop   = (pf_populate)GetProcAddress(snip, "NVSDK_NGX_D3D12_PopulateParameters_Impl");
+    n.init    = (pf_init)    pick(core, snip, "NVSDK_NGX_D3D12_Init", &w1, "core", "snippet!FALLBACK");
+    n.caps    = (pf_get_caps)pick(core, snip, "NVSDK_NGX_D3D12_GetCapabilityParameters", &w2, "core", "snippet!FALLBACK");
+    n.destroy = (pf_destroy) pick(core, snip, "NVSDK_NGX_D3D12_DestroyParameters", &w3, "core", "snippet!FALLBACK");
+    n.create  = (pf_create)  pick(snip, core, "NVSDK_NGX_D3D12_CreateFeature", &w4, "snippet", "core!FALLBACK");
+    n.release = (pf_release) pick(snip, core, "NVSDK_NGX_D3D12_ReleaseFeature", &w5, "snippet", "core!FALLBACK");
+    n.s_iext  = (pf_init_ext)GetProcAddress(snip, "NVSDK_NGX_D3D12_Init_Ext");
+    n.s_pop   = (pf_populate)GetProcAddress(snip, "NVSDK_NGX_D3D12_PopulateParameters_Impl");
     out("exports: Init=%s Caps=%s Destroy=%s CreateFeature=%s Release=%s snippet Init_Ext=%s Populate=%s",
-        w1, w2, w3, w4, w5, ps_iext ? "yes" : "no", ps_pop ? "yes" : "no");
-    if (!p_init || !p_caps || !p_create) { out("RESULT case %d: SKIPPED (missing exports)", case_id); return 3; }
+        w1, w2, w3, w4, w5, n.s_iext ? "yes" : "no", n.s_pop ? "yes" : "no");
+    if (!n.init || !n.caps || !n.create) { out("RESULT: SKIPPED (missing exports)"); return 3; }
 
-    // Data path: the directory of the calling module, as the add-on does.
-    wchar_t data_path[MAX_PATH] = {};
     {
         HMODULE self = nullptr;
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (LPCWSTR)&nrcheck_run, &self);
-        GetModuleFileNameW(self, data_path, MAX_PATH);
-        wchar_t *s = wcsrchr(data_path, L'\\');
-        if (s != nullptr) s[1] = L'\0';
+        GetModuleFileNameW(self, n.data_path, MAX_PATH);
+        wchar_t *sl = wcsrchr(n.data_path, L'\\');
+        if (sl != nullptr) sl[1] = L'\0';
     }
+    n.common.LoggingInfo.LoggingCallback = ngx_cb;
+    n.common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
+    n.common.LoggingInfo.DisableOtherLoggingSinks = false;
 
-    NVSDK_NGX_FeatureCommonInfo common{};
-    common.LoggingInfo.LoggingCallback = ngx_cb;
-    common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
-    common.LoggingInfo.DisableOtherLoggingSinks = false;
+    static const char *const kWhat[9] = {
+        "",
+        "first arm - what the add-on does today",
+        "same NGX session, 2 s later, fresh command list",
+        "clean up, Init again, arm",
+        "clean up, Init again, arm - after 2 s",
+        "clean up, Init again, arm - after 4 s",
+        "clean up, Init again, arm - after 8 s",
+        "NEW device on the neural GPU (old one kept), Init on it, arm",
+        "old neural devices RELEASED, another new device, Init on it, arm" };
 
-    // THE ADD-ON'S ORDER, NOT A RETRY POLICY. In a game the add-on calls core
-    // Init twice on the same device in one process: once in the startup probe
-    // (P1.0c), and again at arm (P4.1), with the session never shut down in
-    // between. The probe stops on a non-Success Init; the arm ignores its
-    // Init result (V31) and goes on to GetCapabilityParameters and
-    // CreateFeature. FAIL_OutOfDate is not a gate (DEBUGGING_LEDGER,
-    // 2026-09-14): on the rig the arm creates both handles with it present.
-    //
-    // So: Init once as the probe does. If that is not Success, Init again on
-    // the same device as the arm does, and carry on from there whatever it
-    // returns. Two calls, because the add-on makes two. No third.
-    NVSDK_NGX_Result r = p_init(0ULL, data_path, dev, &common, NVSDK_NGX_Version_API);
-    out("core Init (probe order): 0x%08X (%s) app_id=0", (unsigned)r, rname(r));
-    const NVSDK_NGX_Result init_r = r;
-    NVSDK_NGX_Result init2_r = r;
-    if (r != NVSDK_NGX_Result_Success)
-    {
-        r = p_init(0ULL, data_path, dev, &common, NVSDK_NGX_Version_API);
-        init2_r = r;
-        out("core Init (arm order, same device, session kept): 0x%08X (%s) - result ignored as the arm does (V31)",
-            (unsigned)r, rname(r));
-    }
-
+    ID3D12Device *dev = devs[0];
     NVSDK_NGX_Parameter *params = nullptr;
-    r = p_caps(&params);
-    out("GetCapabilityParameters: 0x%08X (%s)", (unsigned)r, rname(r));
-    if (r != NVSDK_NGX_Result_Success || params == nullptr)
+    for (int k = 1; k <= 8; ++k)
     {
-        // The arm returns false here too. If this line appears the check has
-        // hit something the add-on would also stop on, and the two Init
-        // results above are the evidence.
-        out("RESULT case %d: NO PARAMETERS 0x%08X (%s) | Init probe 0x%08X (%s), Init arm 0x%08X (%s)",
-            case_id, (unsigned)r, rname(r), (unsigned)init_r, rname(init_r),
-            (unsigned)init2_r, rname(init2_r));
-        return 4;
+        out("");
+        out("attempt %d: %s", k, kWhat[k]);
+
+        // ---- what changes for this attempt ----
+        if (k == 2) Sleep(2000);
+        if (k >= 3)
+        {
+            // Clean up the failed arm: the handle was already released by
+            // arm_once; the parameter block goes here.
+            if (params != nullptr && n.destroy != nullptr)
+            {
+                const NVSDK_NGX_Result d = n.destroy(params);
+                out("  DestroyParameters: 0x%08X (%s)", (unsigned)d, rname(d));
+            }
+            params = nullptr;
+        }
+        if (k == 4) Sleep(2000);
+        if (k == 5) Sleep(4000);
+        if (k == 6) Sleep(8000);
+        if (k == 7)
+        {
+            devs[1] = make_device((UINT)neural_index, "neural (new, old kept)");
+            if (devs[1] == nullptr) { out("  skipped: no new device"); continue; }
+            dev = devs[1];
+        }
+        if (k == 8)
+        {
+            for (int i = 0; i < 2; ++i)
+                if (devs[i] != nullptr) { devs[i]->Release(); devs[i] = nullptr; }
+            out("  earlier neural devices released");
+            devs[2] = make_device((UINT)neural_index, "neural (new, old released)");
+            if (devs[2] == nullptr) { out("  skipped: no new device"); continue; }
+            dev = devs[2];
+        }
+
+        if (params == nullptr) params = open_session(n, dev);
+        if (params == nullptr)
+        {
+            out("  no parameter block - this attempt could not arm");
+            continue;
+        }
+
+        unsigned long seh = 0;
+        const NVSDK_NGX_Result r = arm_once(n, dev, params, &seh);
+        if ((unsigned)r == SEH_FAULT)
+        {
+            out("RESULT: CRASH inside NGX at attempt %d - ladder stopped (V44)", k);
+            return 2;
+        }
+        if (r == NVSDK_NGX_Result_Success)
+        {
+            if (k == 1) out("RESULT: PASS at attempt 1 - the first arm works on this GPU");
+            else        out("RESULT: HEALED at attempt %d - %s", k, kWhat[k]);
+            if (params != nullptr && n.destroy != nullptr) n.destroy(params);
+            return (k == 1) ? 0 : 10 + k;
+        }
     }
-
-    if (ps_iext != nullptr)
-    {
-        r = ps_iext(0ULL, data_path, dev, NVSDK_NGX_Version_API, params);
-        out("snippet Init_Ext: 0x%08X (%s)", (unsigned)r, rname(r));
-    }
-    if (ps_pop != nullptr)
-    {
-        r = ps_pop(params);
-        out("snippet PopulateParameters_Impl: 0x%08X (%s)", (unsigned)r, rname(r));
-    }
-
-    const unsigned W = 1280, H = 720;
-    params->Set(NVSDK_NGX_Parameter_Width, W);
-    params->Set(NVSDK_NGX_Parameter_Height, H);
-    params->Set("DLSSNR.Width", W);
-    params->Set("DLSSNR.Height", H);
-
-    ID3D12CommandQueue *q = nullptr;
-    ID3D12CommandAllocator *al = nullptr;
-    ID3D12GraphicsCommandList *cl = nullptr;
-    ID3D12Fence *fe = nullptr;
-    D3D12_COMMAND_QUEUE_DESC qd{};
-    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) ||
-        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al))) ||
-        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, nullptr, IID_PPV_ARGS(&cl))) ||
-        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fe))))
-    {
-        out("RESULT case %d: SKIPPED (D3D12 objects)", case_id);
-        return 3;
-    }
-
-    NVSDK_NGX_Handle *h = nullptr;
-    unsigned long seh = 0;
-    LARGE_INTEGER f{}, t0{}, t1{};
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&t0);
-    r = create_guarded(p_create, cl, params, &h, &seh);
-    QueryPerformanceCounter(&t1);
-    const double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
-
-    if ((unsigned)r == SEH_FAULT)
-    {
-        // Do not execute a list NGX faulted while recording. Leave now.
-        out("RESULT case %d: CRASH INSIDE NGX CreateFeature (exception 0x%08lX)", case_id, seh);
-        return 2;
-    }
-    out("CreateFeature(Reserved18) %ux%u: 0x%08X (%s) handle=%p elapsed=%.0fms",
-        W, H, (unsigned)r, rname(r), (void *)h, ms);
-
-    // Drain whatever was recorded, as the add-on's probe teardown does.
-    cl->Close();
-    ID3D12CommandList *ls[1] = { cl };
-    q->ExecuteCommandLists(1, ls);
-    q->Signal(fe, 1);
-    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (ev != nullptr && fe->GetCompletedValue() < 1)
-    {
-        fe->SetEventOnCompletion(1, ev);
-        WaitForSingleObject(ev, 10000);
-    }
-    if (ev != nullptr) CloseHandle(ev);
-
-    if (h != nullptr && p_rel != nullptr) p_rel(h);
-    if (p_dest != nullptr) p_dest(params);
-
-    const bool ok = (r == NVSDK_NGX_Result_Success && h != nullptr);
-    out("RESULT case %d: %s 0x%08X (%s) | Init probe 0x%08X (%s), Init arm 0x%08X (%s)", case_id,
-        ok ? "PASS" : "FAIL", (unsigned)r, rname(r), (unsigned)init_r, rname(init_r),
-        (unsigned)init2_r, rname(init2_r));
-    (void)other;   // kept alive until the process exits, on purpose
-    return ok ? 0 : 1;
+    out("RESULT: NOT HEALED - no attempt succeeded");
+    (void)other;   // the game's device stays alive until the process exits
+    return 1;
 }

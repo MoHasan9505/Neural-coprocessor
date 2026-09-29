@@ -20,10 +20,6 @@ If PowerShell refuses to run the script, open a terminal in the game folder and 
 
 ## What it tests
 
-Each GPU is tested three times, each time in a fresh process:
+For each GPU, the check starts the other GPU first, as a game does. It then tries to start DLSS-NR on this GPU up to eight times, and changes one thing between tries. It stops at the first success and reports which try worked.
 
-- **Case 1:** the other GPU starts first, then this GPU. This is how the add-on runs today.
-- **Case 2:** this GPU starts first, then the other GPU.
-- **Case 3:** this GPU alone.
-
-The check takes under a minute.
+The check takes about a minute.

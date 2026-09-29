@@ -1,15 +1,10 @@
-// nrcheck.exe - tests the two candidate fixes for DLSS-NR failing on the
-// second GPU, with no game running.
+// nrcheck.exe - runs the add-on's self-healing arm outside a game, to find
+// which retry shape brings DLSS-NR up on a machine where the first arm fails.
 //
-// Run with no arguments. For every NVIDIA GPU as the neural GPU it runs three
-// cases, each in its own fresh process (NGX keeps state for the life of a
-// process, so cases must not share one):
-//   case 1  CONTROL - the other GPU's device first, then the neural one.
-//           What the add-on does in a game today.
-//   case 2  FIX A - the neural device first, then the other, both alive.
-//           The add-on creating its device before the game does.
-//   case 3  FIX B - the neural device alone. A separate process.
-// The summary names which fix works on this machine.
+// Run with no arguments. For every NVIDIA GPU as the neural GPU it runs one
+// fresh process shaped like a game: the other GPU's device first and kept
+// alive, then the neural device, then up to eight arms, each changing one
+// thing, stopping at the first success. See nrcheck_core.cpp for the ladder.
 // Output goes to the console and to nrcheck_report.txt beside the exe.
 //
 // Internal: nrcheck.exe --case N --neural I --other J --snippet P --log L
@@ -204,7 +199,7 @@ int wmain(int argc, wchar_t **argv)
 
     DeleteFileW(g_report.c_str());
     SYSTEMTIME t; GetLocalTime(&t);
-    say("MGPU Bridge NR check 2.0 - %04u-%02u-%02u %02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
+    say("MGPU Bridge NR check 3.0 - %04u-%02u-%02u %02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
 
     if (snip.empty())
     {
@@ -221,55 +216,43 @@ int wmain(int argc, wchar_t **argv)
             x.driver.c_str(), (unsigned long)x.luid.HighPart, (unsigned long)x.luid.LowPart);
     if (g.empty()) { say("No NVIDIA GPU found."); return 3; }
 
-    struct row { UINT idx; std::wstring name; int ctrl; int fix_a; int fix_b; };
+    struct row { UINT idx; std::wstring name; int code; };
     std::vector<row> rows;
     const bool multi = g.size() > 1;
     for (size_t i = 0; i < g.size(); ++i)
     {
         const UINT other = multi ? g[(i + 1) % g.size()].index : g[i].index;
-        int c[4] = { 3, 3, 3, 3 };
-        for (int k = 1; k <= 3; ++k)
-        {
-            if (!multi && k != 3) continue;   // one GPU: only the "alone" case exists
-            say("");
-            c[k] = run_child(k, g[i].index, other, snip);
-            keep_ngx_logs(k, g[i].index);
-        }
-        rows.push_back({ g[i].index, g[i].name, c[1], c[2], c[3] });
+        say("");
+        const int code = run_child(multi ? 1 : 3, g[i].index, other, snip);
+        keep_ngx_logs(1, g[i].index);
+        rows.push_back({ g[i].index, g[i].name, code });
     }
+
+    static const char *const kWhat[9] = {
+        "", "first arm",
+        "same NGX session, 2 s later, fresh command list",
+        "clean up, Init again, arm",
+        "clean up, Init again, arm - after 2 s",
+        "clean up, Init again, arm - after 4 s",
+        "clean up, Init again, arm - after 8 s",
+        "new device on the neural GPU (old one kept)",
+        "old neural devices released, new device" };
 
     say("");
     say("==================== SUMMARY ====================");
     for (const row &r : rows)
     {
-        say("adapter[%u] %ls as the neural GPU:", r.idx, r.name.c_str());
-        if (!multi)
-        {
-            say("  case 3 FIX B (alone):  %s", word(r.fix_b));
-            say("  -> One GPU only. The two-GPU cases do not apply.");
-            continue;
-        }
-        say("  case 1 CONTROL (other GPU first):  %s", word(r.ctrl));
-        say("  case 2 FIX A   (neural GPU first): %s", word(r.fix_a));
-        say("  case 3 FIX B   (neural GPU alone): %s", word(r.fix_b));
-
-        // Only a CreateFeature that ran counts. 0 = it succeeded, 1 = it
-        // returned an error. Anything else means that case did not reach
-        // CreateFeature and cannot decide anything.
-        if (r.ctrl == 2 || r.fix_a == 2 || r.fix_b == 2)
-            say("  -> NGX crashed in at least one case. See the lines above.");
-        else if (r.ctrl == 0)
-            say("  -> The problem does not happen here: the current order works on this machine.");
-        else if (r.ctrl != 1)
-            say("  -> Inconclusive: the control case did not reach CreateFeature.");
-        else if (r.fix_a == 0)
-            say("  -> FIX A works: create the neural device before the game creates its own.");
-        else if (r.fix_a == 1 && r.fix_b == 0)
-            say("  -> FIX A fails, FIX B works: the neural stage needs its own process.");
-        else if (r.fix_a == 1 && r.fix_b == 1)
-            say("  -> No device order helps: this driver and nvngx_dlssnr.dll fail on this GPU.");
+        if (r.code == 0)
+            say("adapter[%u] %ls: PASS at attempt 1 - the first arm works.", r.idx, r.name.c_str());
+        else if (r.code >= 12 && r.code <= 18)
+            say("adapter[%u] %ls: HEALED at attempt %d - %s.", r.idx, r.name.c_str(),
+                r.code - 10, kWhat[r.code - 10]);
+        else if (r.code == 1)
+            say("adapter[%u] %ls: NOT HEALED - all 8 attempts failed.", r.idx, r.name.c_str());
+        else if (r.code == 2)
+            say("adapter[%u] %ls: CRASH inside NGX - ladder stopped.", r.idx, r.name.c_str());
         else
-            say("  -> Inconclusive: a fix case did not reach CreateFeature.");
+            say("adapter[%u] %ls: %s - see the lines above.", r.idx, r.name.c_str(), word(r.code));
     }
     say("Please attach nrcheck_report.txt and the nvngx_*_case*_adapter*.log files to your GitHub issue.");
     return 0;
