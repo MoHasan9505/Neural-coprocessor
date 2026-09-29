@@ -1,11 +1,15 @@
-// nrcheck.exe - runs the DLSS-NR create check with no game running.
+// nrcheck.exe - tests the two candidate fixes for DLSS-NR failing on the
+// second GPU, with no game running.
 //
-// Run with no arguments. For every NVIDIA GPU it runs two cases, each in its
-// own fresh process (NGX keeps state for the life of a process, so cases must
-// not share one):
-//   case 1  that GPU alone
-//   case 2  the other GPU's D3D12 device created first and kept alive,
-//           then that GPU - the shape the add-on always has in a game
+// Run with no arguments. For every NVIDIA GPU as the neural GPU it runs three
+// cases, each in its own fresh process (NGX keeps state for the life of a
+// process, so cases must not share one):
+//   case 1  CONTROL - the other GPU's device first, then the neural one.
+//           What the add-on does in a game today.
+//   case 2  FIX A - the neural device first, then the other, both alive.
+//           The add-on creating its device before the game does.
+//   case 3  FIX B - the neural device alone. A separate process.
+// The summary names which fix works on this machine.
 // Output goes to the console and to nrcheck_report.txt beside the exe.
 //
 // Internal: nrcheck.exe --case N --neural I --other J --snippet P --log L
@@ -152,7 +156,7 @@ namespace
         case 1:  return "FAIL";
         case 2:  return "CRASH";
         case 3:  return "SKIPPED";
-        case 4:  return "INIT FAILED";
+        case 4:  return "NO PARAMETERS";
         case 0xDEAD: return "TIMEOUT";
         default: return "PROCESS DIED";
         }
@@ -200,7 +204,7 @@ int wmain(int argc, wchar_t **argv)
 
     DeleteFileW(g_report.c_str());
     SYSTEMTIME t; GetLocalTime(&t);
-    say("MGPU Bridge NR check 1.0 - %04u-%02u-%02u %02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
+    say("MGPU Bridge NR check 2.0 - %04u-%02u-%02u %02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
 
     if (snip.empty())
     {
@@ -217,43 +221,55 @@ int wmain(int argc, wchar_t **argv)
             x.driver.c_str(), (unsigned long)x.luid.HighPart, (unsigned long)x.luid.LowPart);
     if (g.empty()) { say("No NVIDIA GPU found."); return 3; }
 
-    struct row { UINT idx; std::wstring name; int c1; int c2; };
+    struct row { UINT idx; std::wstring name; int ctrl; int fix_a; int fix_b; };
     std::vector<row> rows;
+    const bool multi = g.size() > 1;
     for (size_t i = 0; i < g.size(); ++i)
     {
-        const UINT other = (g.size() > 1) ? g[(i + 1) % g.size()].index : g[i].index;
-        say("");
-        const int c1 = run_child(1, g[i].index, other, snip);
-        keep_ngx_logs(1, g[i].index);
-        int c2 = 3;
-        if (g.size() > 1)
+        const UINT other = multi ? g[(i + 1) % g.size()].index : g[i].index;
+        int c[4] = { 3, 3, 3, 3 };
+        for (int k = 1; k <= 3; ++k)
         {
+            if (!multi && k != 3) continue;   // one GPU: only the "alone" case exists
             say("");
-            c2 = run_child(2, g[i].index, other, snip);
-            keep_ngx_logs(2, g[i].index);
+            c[k] = run_child(k, g[i].index, other, snip);
+            keep_ngx_logs(k, g[i].index);
         }
-        rows.push_back({ g[i].index, g[i].name, c1, c2 });
+        rows.push_back({ g[i].index, g[i].name, c[1], c[2], c[3] });
     }
 
     say("");
     say("==================== SUMMARY ====================");
     for (const row &r : rows)
     {
-        say("adapter[%u] %ls: case 1 (alone) %s | case 2 (other GPU first) %s",
-            r.idx, r.name.c_str(), word(r.c1), rows.size() > 1 ? word(r.c2) : "n/a (one GPU)");
-        const bool multi = rows.size() > 1;
-        if (r.c1 == 2 || r.c2 == 2)
-            say("  -> NGX crashed during the check. See the lines above.");
-        else if (r.c1 == 1)
-            say("  -> This driver and nvngx_dlssnr.dll cannot create DLSS-NR on this GPU, even alone.");
-        else if (r.c1 == 0 && multi && r.c2 == 1)
-            say("  -> Works alone, fails when another GPU's device exists first.");
-        else if (r.c1 == 0 && (!multi || r.c2 == 0))
-            say("  -> This GPU, driver and nvngx_dlssnr.dll can create DLSS-NR.");
-        else if (multi && r.c2 == 0)
-            say("  -> Creates DLSS-NR with the other GPU up. Alone, the check did not reach CreateFeature.");
+        say("adapter[%u] %ls as the neural GPU:", r.idx, r.name.c_str());
+        if (!multi)
+        {
+            say("  case 3 FIX B (alone):  %s", word(r.fix_b));
+            say("  -> One GPU only. The two-GPU cases do not apply.");
+            continue;
+        }
+        say("  case 1 CONTROL (other GPU first):  %s", word(r.ctrl));
+        say("  case 2 FIX A   (neural GPU first): %s", word(r.fix_a));
+        say("  case 3 FIX B   (neural GPU alone): %s", word(r.fix_b));
+
+        // Only a CreateFeature that ran counts. 0 = it succeeded, 1 = it
+        // returned an error. Anything else means that case did not reach
+        // CreateFeature and cannot decide anything.
+        if (r.ctrl == 2 || r.fix_a == 2 || r.fix_b == 2)
+            say("  -> NGX crashed in at least one case. See the lines above.");
+        else if (r.ctrl == 0)
+            say("  -> The problem does not happen here: the current order works on this machine.");
+        else if (r.ctrl != 1)
+            say("  -> Inconclusive: the control case did not reach CreateFeature.");
+        else if (r.fix_a == 0)
+            say("  -> FIX A works: create the neural device before the game creates its own.");
+        else if (r.fix_a == 1 && r.fix_b == 0)
+            say("  -> FIX A fails, FIX B works: the neural stage needs its own process.");
+        else if (r.fix_a == 1 && r.fix_b == 1)
+            say("  -> No device order helps: this driver and nvngx_dlssnr.dll fail on this GPU.");
         else
-            say("  -> The check could not finish on this GPU. See the lines above.");
+            say("  -> Inconclusive: a fix case did not reach CreateFeature.");
     }
     say("Please attach nrcheck_report.txt and the nvngx_*_case*_adapter*.log files to your GitHub issue.");
     return 0;

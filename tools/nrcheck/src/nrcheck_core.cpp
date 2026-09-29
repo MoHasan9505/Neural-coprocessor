@@ -11,10 +11,17 @@
 // nrcheck.exe and only this DLL carries the name.
 //
 // WHAT IT DOES
-// One case per process, chosen by the caller:
-//   case 1  a D3D12 device on the neural GPU and nothing else
-//   case 2  a D3D12 device on the OTHER GPU first, kept alive, then the same
-//           as case 1 on the neural GPU
+// It tests the two candidate fixes against the add-on's current behaviour.
+// One case per process, chosen by the caller (the case numbers are the
+// report's):
+//   case 1  CONTROL - what the add-on does today in a game: the other GPU's
+//           device exists first and stays alive, then the neural device.
+//           On an affected machine this is expected to FAIL.
+//   case 2  FIX A, EARLY DEVICE - the neural device is created FIRST, then
+//           the other GPU's device, both kept alive. This is the add-on
+//           creating its device at load, before the game creates its own.
+//   case 3  FIX B, SEPARATE PROCESS - the neural device alone in its process,
+//           which is what a helper process would have.
 // On the neural device it runs the add-on's startup probe (P1.0c) call for
 // call: core Init -> core GetCapabilityParameters -> snippet Init_Ext ->
 // snippet PopulateParameters_Impl -> Width/Height set -> snippet
@@ -172,23 +179,43 @@ namespace
 
 // Returns: 0 = CreateFeature succeeded, 1 = CreateFeature returned an error,
 // 2 = a crash inside NGX was caught, 3 = the check could not reach CreateFeature,
-// 4 = NGX Init failed and nothing after it could run.
+// 4 = GetCapabilityParameters failed after both Inits (the arm stops there too).
 extern "C" __declspec(dllexport)
 int nrcheck_run(int case_id, int neural_index, int other_index,
                 const wchar_t *snippet_path, const wchar_t *log_path)
 {
     if (log_path != nullptr && log_path[0] != L'\0') _wfopen_s(&g_out, log_path, L"a");
 
-    out("---- case %d: neural adapter[%d]%s ----", case_id, neural_index,
-        case_id == 2 ? " (other GPU's device created FIRST and kept alive)" : " (alone)");
+    static const char *const kName[4] = {
+        "", "CONTROL (other GPU first - what the add-on does today)",
+        "FIX A (neural device first, then the other GPU)",
+        "FIX B (neural device alone - separate process)" };
+    out("---- case %d, neural adapter[%d]: %s ----", case_id, neural_index,
+        (case_id >= 1 && case_id <= 3) ? kName[case_id] : "?");
 
+    // Both devices stay alive until the process exits, on purpose: the
+    // question is which device is FIRST in a process where both are live.
     ID3D12Device *other = nullptr;
-    if (case_id == 2)
+    ID3D12Device *dev = nullptr;
+    if (case_id == 1)
     {
-        other = make_device((UINT)other_index, "first ");
+        other = make_device((UINT)other_index, "first  (other)");
         if (other == nullptr) { out("RESULT case %d: SKIPPED (no device on the other GPU)", case_id); return 3; }
+        dev = make_device((UINT)neural_index, "second (neural)");
     }
-    ID3D12Device *dev = make_device((UINT)neural_index, "neural");
+    else if (case_id == 2)
+    {
+        dev = make_device((UINT)neural_index, "first  (neural)");
+        if (dev != nullptr)
+        {
+            other = make_device((UINT)other_index, "second (other)");
+            if (other == nullptr) { out("RESULT case %d: SKIPPED (no device on the other GPU)", case_id); return 3; }
+        }
+    }
+    else
+    {
+        dev = make_device((UINT)neural_index, "only   (neural)");
+    }
     if (dev == nullptr) { out("RESULT case %d: SKIPPED (no device on the neural GPU)", case_id); return 3; }
 
     HMODULE core = load_core();
@@ -228,29 +255,41 @@ int nrcheck_run(int case_id, int neural_index, int other_index,
     common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
     common.LoggingInfo.DisableOtherLoggingSinks = false;
 
+    // THE ADD-ON'S ORDER, NOT A RETRY POLICY. In a game the add-on calls core
+    // Init twice on the same device in one process: once in the startup probe
+    // (P1.0c), and again at arm (P4.1), with the session never shut down in
+    // between. The probe stops on a non-Success Init; the arm ignores its
+    // Init result (V31) and goes on to GetCapabilityParameters and
+    // CreateFeature. FAIL_OutOfDate is not a gate (DEBUGGING_LEDGER,
+    // 2026-09-14): on the rig the arm creates both handles with it present.
+    //
+    // So: Init once as the probe does. If that is not Success, Init again on
+    // the same device as the arm does, and carry on from there whatever it
+    // returns. Two calls, because the add-on makes two. No third.
     NVSDK_NGX_Result r = p_init(0ULL, data_path, dev, &common, NVSDK_NGX_Version_API);
-    out("core Init: 0x%08X (%s) app_id=0", (unsigned)r, rname(r));
-    // V31 rule from the add-on: the Init result is not the verdict. The arm
-    // path continues into CreateFeature after FAIL_OutOfDate and has worked
-    // that way on the rig, so the check does the same. Stopping here would
-    // report a failure the add-on itself does not stop on.
+    out("core Init (probe order): 0x%08X (%s) app_id=0", (unsigned)r, rname(r));
     const NVSDK_NGX_Result init_r = r;
+    NVSDK_NGX_Result init2_r = r;
     if (r != NVSDK_NGX_Result_Success)
-        out("core Init did not return Success - continuing to CreateFeature, as the add-on's arm does (V31)");
+    {
+        r = p_init(0ULL, data_path, dev, &common, NVSDK_NGX_Version_API);
+        init2_r = r;
+        out("core Init (arm order, same device, session kept): 0x%08X (%s) - result ignored as the arm does (V31)",
+            (unsigned)r, rname(r));
+    }
 
     NVSDK_NGX_Parameter *params = nullptr;
     r = p_caps(&params);
     out("GetCapabilityParameters: 0x%08X (%s)", (unsigned)r, rname(r));
     if (r != NVSDK_NGX_Result_Success || params == nullptr)
     {
-        if (init_r != NVSDK_NGX_Result_Success)
-        {
-            out("RESULT case %d: INIT FAILED 0x%08X (%s) - CreateFeature not reached", case_id,
-                (unsigned)init_r, rname(init_r));
-            return 4;
-        }
-        out("RESULT case %d: SKIPPED (no parameters)", case_id);
-        return 3;
+        // The arm returns false here too. If this line appears the check has
+        // hit something the add-on would also stop on, and the two Init
+        // results above are the evidence.
+        out("RESULT case %d: NO PARAMETERS 0x%08X (%s) | Init probe 0x%08X (%s), Init arm 0x%08X (%s)",
+            case_id, (unsigned)r, rname(r), (unsigned)init_r, rname(init_r),
+            (unsigned)init2_r, rname(init2_r));
+        return 4;
     }
 
     if (ps_iext != nullptr)
@@ -320,8 +359,9 @@ int nrcheck_run(int case_id, int neural_index, int other_index,
     if (p_dest != nullptr) p_dest(params);
 
     const bool ok = (r == NVSDK_NGX_Result_Success && h != nullptr);
-    out("RESULT case %d: %s 0x%08X (%s) | core Init was 0x%08X (%s)", case_id, ok ? "PASS" : "FAIL",
-        (unsigned)r, rname(r), (unsigned)init_r, rname(init_r));
+    out("RESULT case %d: %s 0x%08X (%s) | Init probe 0x%08X (%s), Init arm 0x%08X (%s)", case_id,
+        ok ? "PASS" : "FAIL", (unsigned)r, rname(r), (unsigned)init_r, rname(init_r),
+        (unsigned)init2_r, rname(init2_r));
     (void)other;   // kept alive until the process exits, on purpose
     return ok ? 0 : 1;
 }

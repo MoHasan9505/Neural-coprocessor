@@ -20,9 +20,10 @@ If PowerShell refuses to run the script, open a terminal in the game folder and 
 
 ## What it tests
 
-Each GPU is tested twice:
+Each GPU is tested three times, each time in a fresh process:
 
-- **Case 1:** the GPU alone.
-- **Case 2:** the other GPU starts first, then this GPU. This is how the add-on runs inside a game.
+- **Case 1:** the other GPU starts first, then this GPU. This is how the add-on runs today.
+- **Case 2:** this GPU starts first, then the other GPU.
+- **Case 3:** this GPU alone.
 
 The check takes under a minute.
