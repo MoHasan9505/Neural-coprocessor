@@ -122,6 +122,28 @@ namespace
         return (int)code;
     }
 
+    // NGX writes nvngx.log and nvngx_dlssnr_<ver>.log into the data path and
+    // rewrites them in every process, so without this only the last case's
+    // logs would survive. Each case's pair is renamed after it finishes.
+    void keep_ngx_logs(int c, UINT adapter)
+    {
+        const std::wstring tag = L"_case" + std::to_wstring(c) + L"_adapter" + std::to_wstring(adapter);
+        const std::wstring core = g_dir + L"nvngx.log";
+        if (exists(core))
+            MoveFileExW(core.c_str(), (g_dir + L"nvngx" + tag + L".log").c_str(), MOVEFILE_REPLACE_EXISTING);
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((g_dir + L"nvngx_dlssnr_*.log").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do
+        {
+            std::wstring n = fd.cFileName;
+            if (n.find(L"_case") != std::wstring::npos) continue;   // already kept
+            std::wstring stem = n.substr(0, n.size() - 4);
+            MoveFileExW((g_dir + n).c_str(), (g_dir + stem + tag + L".log").c_str(), MOVEFILE_REPLACE_EXISTING);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+
     const char *word(int code)
     {
         switch (code)
@@ -130,6 +152,7 @@ namespace
         case 1:  return "FAIL";
         case 2:  return "CRASH";
         case 3:  return "SKIPPED";
+        case 4:  return "INIT FAILED";
         case 0xDEAD: return "TIMEOUT";
         default: return "PROCESS DIED";
         }
@@ -201,8 +224,14 @@ int wmain(int argc, wchar_t **argv)
         const UINT other = (g.size() > 1) ? g[(i + 1) % g.size()].index : g[i].index;
         say("");
         const int c1 = run_child(1, g[i].index, other, snip);
+        keep_ngx_logs(1, g[i].index);
         int c2 = 3;
-        if (g.size() > 1) { say(""); c2 = run_child(2, g[i].index, other, snip); }
+        if (g.size() > 1)
+        {
+            say("");
+            c2 = run_child(2, g[i].index, other, snip);
+            keep_ngx_logs(2, g[i].index);
+        }
         rows.push_back({ g[i].index, g[i].name, c1, c2 });
     }
 
@@ -212,13 +241,20 @@ int wmain(int argc, wchar_t **argv)
     {
         say("adapter[%u] %ls: case 1 (alone) %s | case 2 (other GPU first) %s",
             r.idx, r.name.c_str(), word(r.c1), rows.size() > 1 ? word(r.c2) : "n/a (one GPU)");
-        if (r.c1 != 0)
+        const bool multi = rows.size() > 1;
+        if (r.c1 == 2 || r.c2 == 2)
+            say("  -> NGX crashed during the check. See the lines above.");
+        else if (r.c1 == 1)
             say("  -> This driver and nvngx_dlssnr.dll cannot create DLSS-NR on this GPU, even alone.");
-        else if (rows.size() > 1 && r.c2 != 0)
+        else if (r.c1 == 0 && multi && r.c2 == 1)
             say("  -> Works alone, fails when another GPU's device exists first.");
-        else
+        else if (r.c1 == 0 && (!multi || r.c2 == 0))
             say("  -> This GPU, driver and nvngx_dlssnr.dll can create DLSS-NR.");
+        else if (multi && r.c2 == 0)
+            say("  -> Creates DLSS-NR with the other GPU up. Alone, the check did not reach CreateFeature.");
+        else
+            say("  -> The check could not finish on this GPU. See the lines above.");
     }
-    say("Please attach nrcheck_report.txt to your GitHub issue.");
+    say("Please attach nrcheck_report.txt and the nvngx_*_case*_adapter*.log files to your GitHub issue.");
     return 0;
 }

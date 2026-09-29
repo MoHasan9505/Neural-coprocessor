@@ -47,7 +47,12 @@ if (Test-Path (Join-Path $here 'nvngx_dlssnr.dll')) {
 $os = (Get-CimInstance Win32_OperatingSystem)
 Add-Content $report "Windows: $($os.Caption) $($os.Version)"
 
+# One zip with the report and every per-case NGX log, so there is one file to attach.
+$zip = Join-Path $here 'nrcheck_results.zip'
+$files = @($report) + @(Get-ChildItem -Path $here -Filter 'nvngx*_case*_adapter*.log' | ForEach-Object { $_.FullName })
+Compress-Archive -Path $files -DestinationPath $zip -Force
+
 Write-Host ''
-Write-Host "Report written to: $report" -ForegroundColor Green
-Write-Host 'Please attach nrcheck_report.txt to your GitHub issue.'
+Write-Host "Results written to: $zip" -ForegroundColor Green
+Write-Host 'Please attach nrcheck_results.zip to your GitHub issue.'
 Read-Host 'Press Enter to close'

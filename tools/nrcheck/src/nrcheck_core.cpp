@@ -171,7 +171,8 @@ namespace
 }
 
 // Returns: 0 = CreateFeature succeeded, 1 = CreateFeature returned an error,
-// 2 = a crash inside NGX was caught, 3 = the check could not reach CreateFeature.
+// 2 = a crash inside NGX was caught, 3 = the check could not reach CreateFeature,
+// 4 = NGX Init failed and nothing after it could run.
 extern "C" __declspec(dllexport)
 int nrcheck_run(int case_id, int neural_index, int other_index,
                 const wchar_t *snippet_path, const wchar_t *log_path)
@@ -229,12 +230,28 @@ int nrcheck_run(int case_id, int neural_index, int other_index,
 
     NVSDK_NGX_Result r = p_init(0ULL, data_path, dev, &common, NVSDK_NGX_Version_API);
     out("core Init: 0x%08X (%s) app_id=0", (unsigned)r, rname(r));
-    if (r != NVSDK_NGX_Result_Success) { out("RESULT case %d: INIT FAILED 0x%08X (%s)", case_id, (unsigned)r, rname(r)); return 3; }
+    // V31 rule from the add-on: the Init result is not the verdict. The arm
+    // path continues into CreateFeature after FAIL_OutOfDate and has worked
+    // that way on the rig, so the check does the same. Stopping here would
+    // report a failure the add-on itself does not stop on.
+    const NVSDK_NGX_Result init_r = r;
+    if (r != NVSDK_NGX_Result_Success)
+        out("core Init did not return Success - continuing to CreateFeature, as the add-on's arm does (V31)");
 
     NVSDK_NGX_Parameter *params = nullptr;
     r = p_caps(&params);
     out("GetCapabilityParameters: 0x%08X (%s)", (unsigned)r, rname(r));
-    if (r != NVSDK_NGX_Result_Success || params == nullptr) { out("RESULT case %d: SKIPPED (no parameters)", case_id); return 3; }
+    if (r != NVSDK_NGX_Result_Success || params == nullptr)
+    {
+        if (init_r != NVSDK_NGX_Result_Success)
+        {
+            out("RESULT case %d: INIT FAILED 0x%08X (%s) - CreateFeature not reached", case_id,
+                (unsigned)init_r, rname(init_r));
+            return 4;
+        }
+        out("RESULT case %d: SKIPPED (no parameters)", case_id);
+        return 3;
+    }
 
     if (ps_iext != nullptr)
     {
@@ -303,7 +320,8 @@ int nrcheck_run(int case_id, int neural_index, int other_index,
     if (p_dest != nullptr) p_dest(params);
 
     const bool ok = (r == NVSDK_NGX_Result_Success && h != nullptr);
-    out("RESULT case %d: %s 0x%08X (%s)", case_id, ok ? "PASS" : "FAIL", (unsigned)r, rname(r));
+    out("RESULT case %d: %s 0x%08X (%s) | core Init was 0x%08X (%s)", case_id, ok ? "PASS" : "FAIL",
+        (unsigned)r, rname(r), (unsigned)init_r, rname(init_r));
     (void)other;   // kept alive until the process exits, on purpose
     return ok ? 0 : 1;
 }

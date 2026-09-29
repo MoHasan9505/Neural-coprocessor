@@ -1,6 +1,6 @@
 # MGPU Bridge NR check (experimental)
 
-This checks whether your NVIDIA driver and your `nvngx_dlssnr.dll` can start DLSS-NR on each of your GPUs. No game runs during the check, and nothing on your system is changed. It does not replace or modify the add-on.
+This checks whether your NVIDIA driver and your `nvngx_dlssnr.dll` can start DLSS-NR on each of your GPUs. No game runs during the check. It does not change your driver, the add-on or any game files.
 
 ## Get it
 
@@ -14,9 +14,9 @@ Use one of these:
 1. Close the game.
 2. Copy `nrcheck.exe`, `nvngx.dll_nrcheck.dll` and `Verify-NRCheck.ps1` into the game folder, beside the `mgpu\` folder.
 3. Right-click `Verify-NRCheck.ps1` > **Run with PowerShell**.
-4. Attach `nrcheck_report.txt` to your GitHub issue.
+4. Attach `nrcheck_results.zip` to your GitHub issue.
 
-If PowerShell refuses to run the script, open a terminal in the game folder and run `nrcheck.exe`. It writes the same report.
+If PowerShell refuses to run the script, open a terminal in the game folder and run `nrcheck.exe`. It writes `nrcheck_report.txt` and the `nvngx_*_case*_adapter*.log` files. Attach those instead.
 
 ## What it tests
 
