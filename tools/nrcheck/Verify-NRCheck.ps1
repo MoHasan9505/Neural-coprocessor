@@ -7,6 +7,8 @@
 # It tests whether your driver and your nvngx_dlssnr.dll can start DLSS-NR on
 # each of your GPUs, with no game running, and writes nrcheck_report.txt.
 
+param([int]$Synthetic = 0)
+
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $here
@@ -33,7 +35,7 @@ if (-not $snippet) {
     exit 1
 }
 
-& $exe --snippet $snippet
+& $exe --snippet $snippet --synthetic $Synthetic
 
 $report = Join-Path $here 'nrcheck_report.txt'
 $hash = (Get-FileHash -Algorithm SHA256 $snippet).Hash

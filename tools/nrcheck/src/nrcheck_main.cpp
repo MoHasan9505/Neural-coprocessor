@@ -18,12 +18,27 @@
 #include <string>
 #include <vector>
 
+// ---- SYNTHETIC FORWARDER ----
+// Called by nvngx.dll_nrcheck.dll for synthetic attempts only. Its whole job
+// is to be the module NGX sees as the caller: nrcheck.exe has no "nvngx.dll"
+// in its path, so nvngx_dlssnr.dll refuses the call with 0xBAD00002. The
+// result goes through a volatile on purpose: a tail call would make the
+// return address the DLL's again and the refusal would not happen.
+typedef unsigned (*ngx_create_raw)(void *cl, int feat, void *params, void **h);
+extern "C" __declspec(dllexport) __declspec(noinline)
+unsigned nrcheck_foreign_create(void *fn, void *cl, int feat, void *params, void **h)
+{
+    volatile unsigned r = ((ngx_create_raw)fn)(cl, feat, params, h);
+    return r;
+}
+
 namespace
 {
     std::wstring g_dir;        // exe directory, with trailing backslash
     std::wstring g_report;     // report path
     std::wstring g_details;    // where the children write; folded into the report at the end
     std::string  g_head;       // header + summary: the top of the report
+    int          g_synthetic = 0;   // --synthetic N: first N arms made to fail by NGX itself
 
     // The report is written ONCE, at the end, summary first and the NGX
     // return codes after it under their own heading. A reader - or an AI fed
@@ -130,7 +145,8 @@ namespace
         GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
         std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --case " + std::to_wstring(c) +
             L" --neural " + std::to_wstring(neural) + L" --other " + std::to_wstring(other) +
-            L" --snippet \"" + snip + L"\" --log \"" + g_details + L"\"";
+            L" --snippet \"" + snip + L"\" --log \"" + g_details + L"\"" +
+            L" --synthetic " + std::to_wstring(g_synthetic);
         std::vector<wchar_t> buf(cmd.begin(), cmd.end());
         buf.push_back(L'\0');
         STARTUPINFOW si{}; si.cb = sizeof si;
@@ -195,13 +211,14 @@ namespace
             else if (!wcscmp(argv[i], L"--other"))   o = _wtoi(argv[++i]);
             else if (!wcscmp(argv[i], L"--snippet")) snip = argv[++i];
             else if (!wcscmp(argv[i], L"--log"))     log = argv[++i];
+            else if (!wcscmp(argv[i], L"--synthetic")) g_synthetic = _wtoi(argv[++i]);
         }
         HMODULE m = LoadLibraryW((g_dir + L"nvngx.dll_nrcheck.dll").c_str());
         if (m == nullptr) { printf("nvngx.dll_nrcheck.dll not found beside nrcheck.exe\n"); return 3; }
-        typedef int (*run_fn)(int, int, int, const wchar_t *, const wchar_t *);
+        typedef int (*run_fn)(int, int, int, const wchar_t *, const wchar_t *, int);
         run_fn run = (run_fn)GetProcAddress(m, "nrcheck_run");
         if (run == nullptr) return 3;
-        return run(c, n, o, snip.c_str(), log.c_str());
+        return run(c, n, o, snip.c_str(), log.c_str(), g_synthetic);
     }
 }
 
@@ -219,7 +236,12 @@ int wmain(int argc, wchar_t **argv)
 
     std::wstring snip;
     for (int i = 1; i + 1 < argc; ++i)
+    {
         if (!wcscmp(argv[i], L"--snippet")) snip = argv[i + 1];
+        if (!wcscmp(argv[i], L"--synthetic")) g_synthetic = _wtoi(argv[i + 1]);
+    }
+    if (g_synthetic < 0) g_synthetic = 0;
+    if (g_synthetic > 7) g_synthetic = 7;   // attempt 8 must stay real
     if (snip.empty())
     {
         if (exists(g_dir + L"mgpu\\nvngx_dlssnr.dll")) snip = g_dir + L"mgpu\\nvngx_dlssnr.dll";
@@ -229,7 +251,7 @@ int wmain(int argc, wchar_t **argv)
     DeleteFileW(g_report.c_str());
     DeleteFileW(g_details.c_str());
     SYSTEMTIME t; GetLocalTime(&t);
-    say("MGPU Bridge NR check 3.1 - %04u-%02u-%02u %02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
+    say("MGPU Bridge NR check 3.2 - %04u-%02u-%02u %02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
 
     if (snip.empty())
     {
@@ -250,7 +272,7 @@ int wmain(int argc, wchar_t **argv)
     struct row { UINT idx; std::wstring name; int code; int setups; };
     std::vector<row> rows;
     const bool multi = g.size() > 1;
-    const int kSetupTries = 5;
+    const int kSetupTries = 10;
     for (size_t i = 0; i < g.size(); ++i)
     {
         const UINT other = multi ? g[(i + 1) % g.size()].index : g[i].index;
@@ -281,6 +303,9 @@ int wmain(int argc, wchar_t **argv)
     say("");
     say("==================== SUMMARY ====================");
     say("Only tries that reached DLSS-NR creation (CreateFeature) count here.");
+    if (g_synthetic > 0)
+        say("SYNTHETIC RUN: tries 1-%d were refused on purpose by NGX (0xBAD00002). "
+            "A healthy PC should read HEALED on try %d.", g_synthetic, g_synthetic + 1);
     for (const row &r : rows)
     {
         if (r.code == 0)
@@ -294,6 +319,9 @@ int wmain(int argc, wchar_t **argv)
         else if (r.code == 2)
             say("adapter[%u] %ls: CRASH - NGX crashed during DLSS-NR creation. The check stopped.",
                 r.idx, r.name.c_str());
+        else if (r.code == 6)
+            say("adapter[%u] %ls: SYNTHETIC INVALID - NGX did not refuse the synthetic try as expected. "
+                "This reference run cannot be used. See the details.", r.idx, r.name.c_str());
         else if (r.code == 5)
             say("adapter[%u] %ls: NOT REACHED - the check could not get far enough to try DLSS-NR "
                 "creation (%d attempts). This result says nothing about this PC.",

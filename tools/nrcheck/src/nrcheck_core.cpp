@@ -26,6 +26,10 @@
 //   attempt 7  a NEW device on the neural GPU (old one kept), Init on it, arm
 //   attempt 8  old neural devices RELEASED, another new one, Init on it, arm
 //
+// --synthetic N makes attempts 1..N call CreateFeature from nrcheck.exe, which
+// NGX refuses with its own 0xBAD00002 (see create_foreign_guarded). On a
+// healthy PC the ladder should then read HEALED at attempt N+1.
+//
 // The attempt that first succeeds is the shape the add-on's self-healing arm
 // needs. A crash inside NGX ends the ladder: the add-on never re-enters NGX
 // after a caught fault (V44), and neither does this.
@@ -87,6 +91,34 @@ namespace
                                     unsigned long *code)
     {
         __try { return fn(cl, NVSDK_NGX_Feature_Reserved18, p, h); }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            *code = (unsigned long)GetExceptionCode();
+            return (NVSDK_NGX_Result)SEH_FAULT;
+        }
+    }
+
+    // ---- SYNTHETIC: a real 0xBAD00002 from NGX, on purpose ----
+    //
+    // nvngx_dlssnr.dll refuses CreateFeature with 0xBAD00002
+    // FAIL_PlatformError when the module that calls it does not have
+    // "nvngx.dll" in its path. nrcheck.exe does not. So for a synthetic
+    // attempt the call is made through a forwarder exported by nrcheck.exe,
+    // and NGX itself refuses it - nothing is faked here, the code is NGX's.
+    // This is how a healthy PC produces a reference report that shows the
+    // self-healing arm recovering from a real PlatformError.
+    typedef unsigned (*pf_foreign)(void *fn, void *cl, int feat, void *params, void **h);
+
+    NVSDK_NGX_Result create_foreign_guarded(pf_foreign fwd, pf_create fn,
+                                            ID3D12GraphicsCommandList *cl,
+                                            NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **h,
+                                            unsigned long *code)
+    {
+        __try
+        {
+            return (NVSDK_NGX_Result)fwd((void *)fn, cl, (int)NVSDK_NGX_Feature_Reserved18, p,
+                                         (void **)h);
+        }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             *code = (unsigned long)GetExceptionCode();
@@ -238,7 +270,7 @@ namespace
     // drain, release the handle. Returns the CreateFeature result, or
     // SEH_FAULT with *seh set. Nothing NGX recorded is executed after a fault.
     NVSDK_NGX_Result arm_once(const ngx_api &n, ID3D12Device *dev, NVSDK_NGX_Parameter *params,
-                              unsigned long *seh)
+                              unsigned long *seh, pf_foreign synthetic)
     {
         ID3D12CommandQueue *q = nullptr;
         ID3D12CommandAllocator *al = nullptr;
@@ -260,14 +292,17 @@ namespace
         LARGE_INTEGER f{}, t0{}, t1{};
         QueryPerformanceFrequency(&f);
         QueryPerformanceCounter(&t0);
-        const NVSDK_NGX_Result r = create_guarded(n.create, cl, params, &h, seh);
+        const NVSDK_NGX_Result r = (synthetic != nullptr)
+            ? create_foreign_guarded(synthetic, n.create, cl, params, &h, seh)
+            : create_guarded(n.create, cl, params, &h, seh);
         QueryPerformanceCounter(&t1);
         if ((unsigned)r == SEH_FAULT)
         {
             out("  CreateFeature(Reserved18): CRASH INSIDE NGX (exception 0x%08lX)", *seh);
             return r;   // deliberately leaked: nothing NGX touched is reused
         }
-        out("  CreateFeature(Reserved18) 1280x720: 0x%08X (%s) handle=%p elapsed=%.0fms",
+        out("  CreateFeature(Reserved18) 1280x720%s: 0x%08X (%s) handle=%p elapsed=%.0fms",
+            synthetic ? " [SYNTHETIC - called from nrcheck.exe]" : "",
             (unsigned)r, rname(r), (void *)h,
             (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
 
@@ -294,6 +329,8 @@ namespace
 //   1      no attempt succeeded
 //   2      a crash inside NGX ended the ladder
 //   3      the check could not start (devices, modules, exports)
+//   6      SYNTHETIC run only: a synthetic attempt did not return
+//          0xBAD00002, so the reference run is not valid
 //   5      NGX was not usable in this process, so no attempt reached
 //          CreateFeature. This is about the check, not the machine: the
 //          parent starts a fresh process and tries again. Measured on a
@@ -303,7 +340,7 @@ namespace
 //          fresh process has come up clean.
 extern "C" __declspec(dllexport)
 int nrcheck_run(int case_id, int neural_index, int other_index,
-                const wchar_t *snippet_path, const wchar_t *log_path)
+                const wchar_t *snippet_path, const wchar_t *log_path, int synthetic_n)
 {
     if (log_path != nullptr && log_path[0] != L'\0') _wfopen_s(&g_out, log_path, L"a");
     const bool two_gpus = (case_id == 1);   // 1 = other GPU present, 3 = neural GPU only
@@ -421,7 +458,26 @@ int nrcheck_run(int case_id, int neural_index, int other_index,
         reached_create = true;
 
         unsigned long seh = 0;
-        const NVSDK_NGX_Result r = arm_once(n, dev, params, &seh);
+        pf_foreign fwd = nullptr;
+        if (k <= synthetic_n)
+        {
+            fwd = (pf_foreign)GetProcAddress(GetModuleHandleW(nullptr), "nrcheck_foreign_create");
+            if (fwd == nullptr)
+            {
+                out("RESULT: SYNTHETIC NOT AVAILABLE - nrcheck.exe does not export the forwarder");
+                return 6;
+            }
+            out("  this attempt is SYNTHETIC: NGX is expected to refuse it with 0xBAD00002");
+        }
+        const NVSDK_NGX_Result r = arm_once(n, dev, params, &seh, fwd);
+        if (fwd != nullptr && (unsigned)r != SEH_FAULT &&
+            r != NVSDK_NGX_Result_FAIL_PlatformError)
+        {
+            out("RESULT: SYNTHETIC INVALID - NGX returned 0x%08X (%s), not 0xBAD00002, "
+                "for a call from nrcheck.exe", (unsigned)r, rname(r));
+            if (params != nullptr && n.destroy != nullptr) n.destroy(params);
+            return 6;
+        }
         if ((unsigned)r == SEH_FAULT)
         {
             out("RESULT: CRASH inside NGX at attempt %d - ladder stopped (V44)", k);
