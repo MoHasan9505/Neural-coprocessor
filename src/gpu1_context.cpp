@@ -1109,6 +1109,10 @@ bool in_recovery();
 void recovery_tick_presented();
 void arm_sentinel_set();
 void arm_sentinel_clear();
+// R210. Defined beside report_resident_addons (R186). Declared here, at
+// namespace scope, for the same reason R186 is: stream_nr_create sits in an
+// anonymous namespace far above the definition.
+void report_process_census_at_arm();
 // arm_fault_recover is NOT declared here: it takes a stream_state &, a type
 // that is not declared this early. It is defined in the anonymous namespace
 // immediately above stream_nr_create, which is its only caller.
@@ -11147,6 +11151,12 @@ namespace
     {
         char line[900];
 
+        // R210. Diagnostic only. Once per launch, before this function touches
+        // NGX: no command list is open, no NGX call is in flight, s.cs is not
+        // held (the caller drops it before calling in). It reads the module
+        // list and file versions and changes nothing.
+        report_process_census_at_arm();
+
         ngx_modules mods;
         mods.core = GetModuleHandleW(L"_nvngx.dll");
         if (mods.core == nullptr) mods.core = LoadLibraryW(L"_nvngx.dll");
@@ -12856,6 +12866,226 @@ void report_resident_addons()
              "own module is listed too, so a count of 1 means we are alone.",
              n, total);
     mgpu::diag::info(line);
+}
+
+// ---- R210: THE WHOLE PROCESS, AT THE MOMENT OF THE ARM ----
+//
+// R186 names only .addon64 modules and counts the rest. The DLSS-NR
+// PlatformError (NvAPI -1 in the snippet log, "Fast UAV clear: not supported")
+// arms in one game and fails in another ON THE SAME PC, with the same driver
+// and the same snippet. What else lives in the process is the variable no log
+// recorded, so this prints every module once, at the start of the arm.
+//
+// WHAT GOES OUT: module file name, file version, and a folder CLASS (mgpu,
+// game, system, other). Never the full path - a path can carry the user's
+// name. For NGX modules only (name starts nvngx or _nvngx) also the file size
+// and SHA-256: two builds of the same snippet can carry the same version
+// (2026-10-02: a reporter's fix involved a different 310.8 build, and nothing
+// in the log could say which build any run had loaded).
+//
+// GPUs are NOT listed here. [T2] adapter[n] already lists every DXGI adapter,
+// integrated and other vendors included, on every init_device. Enumerating
+// again from the arm would mean a DXGI factory on the bridge thread, which on
+// a Streamline title goes through the interposer - a call path this file
+// avoids adding for a diagnostic.
+//
+// IT IS NOT A JUDGEMENT. A module listed here is not a fault, and the lines
+// must not be read as one. Diagnostic only: reads, never patches, never loads
+// anything except version.dll (to read versions; refcounted, released after).
+namespace
+{
+    typedef DWORD (WINAPI *r210_gfvis_fn)(LPCWSTR, LPDWORD);
+    typedef BOOL  (WINAPI *r210_gfvi_fn )(LPCWSTR, DWORD, DWORD, LPVOID);
+    typedef BOOL  (WINAPI *r210_vqv_fn  )(LPCVOID, LPCWSTR, LPVOID *, PUINT);
+
+    void r210_file_version(const wchar_t *path, HMODULE ver_dll, char *out, size_t out_n)
+    {
+        snprintf(out, out_n, "-");
+        if (ver_dll == nullptr || path == nullptr || path[0] == L'\0') return;
+        r210_gfvis_fn p_size = (r210_gfvis_fn)GetProcAddress(ver_dll, "GetFileVersionInfoSizeW");
+        r210_gfvi_fn  p_get  = (r210_gfvi_fn )GetProcAddress(ver_dll, "GetFileVersionInfoW");
+        r210_vqv_fn   p_q    = (r210_vqv_fn  )GetProcAddress(ver_dll, "VerQueryValueW");
+        if (p_size == nullptr || p_get == nullptr || p_q == nullptr) return;
+        DWORD ignored = 0;
+        const DWORD sz = p_size(path, &ignored);
+        // Bounded on purpose, as in sl_probe: a version block this large is
+        // not a version block.
+        if (sz == 0 || sz > 65536u) return;
+        void *blob = LocalAlloc(LPTR, sz);
+        if (blob == nullptr) return;
+        VS_FIXEDFILEINFO *ffi = nullptr;
+        UINT len = 0;
+        if (p_get(path, 0, sz, blob) &&
+            p_q(blob, L"\\", (LPVOID *)&ffi, &len) &&
+            ffi != nullptr && len >= sizeof(VS_FIXEDFILEINFO))
+        {
+            snprintf(out, out_n, "%u.%u.%u.%u",
+                     (unsigned)HIWORD(ffi->dwFileVersionMS), (unsigned)LOWORD(ffi->dwFileVersionMS),
+                     (unsigned)HIWORD(ffi->dwFileVersionLS), (unsigned)LOWORD(ffi->dwFileVersionLS));
+        }
+        LocalFree(blob);
+    }
+
+    // SHA-256 of a file through CNG, resolved at run time from bcrypt.dll so
+    // the build gains no link library (same rule as version.dll above).
+    // Reads the file in 1 MB chunks with FILE_SHARE_READ|WRITE|DELETE, so it
+    // never blocks the process that has the module mapped. Any failure prints
+    // "-" and costs that field only.
+    typedef long (WINAPI *r210_open_fn  )(void **, LPCWSTR, LPCWSTR, ULONG);
+    typedef long (WINAPI *r210_close_fn )(void *, ULONG);
+    typedef long (WINAPI *r210_create_fn)(void *, void **, PUCHAR, ULONG, PUCHAR, ULONG, ULONG);
+    typedef long (WINAPI *r210_data_fn  )(void *, PUCHAR, ULONG, ULONG);
+    typedef long (WINAPI *r210_finish_fn)(void *, PUCHAR, ULONG, ULONG);
+    typedef long (WINAPI *r210_destroy_fn)(void *);
+
+    void r210_file_sha256(const wchar_t *path, HMODULE bc, char *out, size_t out_n,
+                          unsigned long long &size_out)
+    {
+        snprintf(out, out_n, "-");
+        size_out = 0ull;
+        if (bc == nullptr || path == nullptr || path[0] == L'\0') return;
+        r210_open_fn    p_open    = (r210_open_fn   )GetProcAddress(bc, "BCryptOpenAlgorithmProvider");
+        r210_close_fn   p_close   = (r210_close_fn  )GetProcAddress(bc, "BCryptCloseAlgorithmProvider");
+        r210_create_fn  p_create  = (r210_create_fn )GetProcAddress(bc, "BCryptCreateHash");
+        r210_data_fn    p_data    = (r210_data_fn   )GetProcAddress(bc, "BCryptHashData");
+        r210_finish_fn  p_finish  = (r210_finish_fn )GetProcAddress(bc, "BCryptFinishHash");
+        r210_destroy_fn p_destroy = (r210_destroy_fn)GetProcAddress(bc, "BCryptDestroyHash");
+        if (!p_open || !p_close || !p_create || !p_data || !p_finish || !p_destroy) return;
+
+        HANDLE f = CreateFileW(path, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return;
+        LARGE_INTEGER fs{};
+        if (GetFileSizeEx(f, &fs)) size_out = (unsigned long long)fs.QuadPart;
+
+        const DWORD kChunk = 1u << 20;
+        void *buf = VirtualAlloc(nullptr, kChunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        void *alg = nullptr, *h = nullptr;
+        bool ok = buf != nullptr &&
+                  p_open(&alg, L"SHA256", nullptr, 0) >= 0 &&
+                  p_create(alg, &h, nullptr, 0, nullptr, 0, 0) >= 0;
+        while (ok)
+        {
+            DWORD got = 0;
+            if (!ReadFile(f, buf, kChunk, &got, nullptr)) { ok = false; break; }
+            if (got == 0) break;
+            if (p_data(h, (PUCHAR)buf, got, 0) < 0) ok = false;
+        }
+        unsigned char dg[32] = {};
+        if (ok && p_finish(h, dg, sizeof dg, 0) >= 0 && out_n >= 65)
+        {
+            for (int k = 0; k < 32; ++k) snprintf(out + 2 * k, 3, "%02X", (unsigned)dg[k]);
+        }
+        if (h != nullptr)   p_destroy(h);
+        if (alg != nullptr) p_close(alg, 0);
+        if (buf != nullptr) VirtualFree(buf, 0, MEM_RELEASE);
+        CloseHandle(f);
+    }
+
+    bool r210_is_ngx(const wchar_t *name)
+    {
+        return _wcsnicmp(name, L"nvngx", 5) == 0 || _wcsnicmp(name, L"_nvngx", 6) == 0;
+    }
+
+    // mgpu = a subfolder of THIS add-on's folder - where the private snippet is
+    // loaded from (find_private_snippet: mgpu\ first, then any immediate
+    // subfolder). game = the executable's folder or below. system = the
+    // Windows folder or below (System32, the driver store under it, WinSxS).
+    // other = anything else: overlays, launchers, Program Files.
+    const char *r210_where(const wchar_t *path, const wchar_t *addon_dir,
+                           const wchar_t *game_dir, const wchar_t *win_dir)
+    {
+        const size_t al = wcslen(addon_dir), gl = wcslen(game_dir), wl = wcslen(win_dir);
+        if (al != 0 && _wcsnicmp(path, addon_dir, al) == 0 && wcschr(path + al, L'\\') != nullptr)
+            return "mgpu";
+        if (gl != 0 && _wcsnicmp(path, game_dir, gl) == 0) return "game";
+        if (wl != 0 && _wcsnicmp(path, win_dir,  wl) == 0) return "system";
+        return "other";
+    }
+}
+
+void report_process_census_at_arm()
+{
+    // Once per launch. A later arm in the same process would print the same
+    // list and bury the lines around it.
+    static std::atomic<int> s_once{0};
+    if (s_once.exchange(1) != 0) return;
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE)
+    {
+        mgpu::diag::warn("[MGPU][R210] could not snapshot the module list at arm - nothing can "
+                         "be said about what else was in the process.");
+        return;
+    }
+
+    wchar_t game_dir[MAX_PATH] = {};
+    wchar_t win_dir[MAX_PATH]  = {};
+    if (GetModuleFileNameW(nullptr, game_dir, MAX_PATH) != 0)
+    {
+        wchar_t *slash = wcsrchr(game_dir, L'\\');
+        if (slash != nullptr) slash[1] = L'\0'; else game_dir[0] = L'\0';
+    }
+    else game_dir[0] = L'\0';
+    if (GetWindowsDirectoryW(win_dir, MAX_PATH) == 0) win_dir[0] = L'\0';
+    wchar_t addon_dir[MAX_PATH * 2] = {};
+    if (!addon_dir_w(addon_dir, MAX_PATH * 2)) addon_dir[0] = L'\0';
+
+    const bool nvapi = GetModuleHandleW(L"nvapi64.dll") != nullptr;
+
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof me;
+    unsigned total = 0;
+    if (Module32FirstW(snap, &me))
+        do { ++total; } while (Module32NextW(snap, &me));
+
+    char l[512];
+    snprintf(l, sizeof l,
+             "[MGPU][R210] PROCESS CENSUS AT ARM BEGIN: %u modules | nvapi64.dll %s. One line per "
+             "module follows: name, file version, folder (mgpu / game / system / other), and "
+             "size + SHA-256 for NGX modules. Compare two "
+             "games on the same PC line by line. A module listed here is not a fault.",
+             total, nvapi ? "resident" : "NOT resident");
+    mgpu::diag::info(l);
+
+    HMODULE ver_dll = LoadLibraryW(L"version.dll");
+    HMODULE bc_dll  = LoadLibraryW(L"bcrypt.dll");
+    unsigned i = 0, n_game = 0, n_sys = 0, n_other = 0;
+    me = MODULEENTRY32W{};
+    me.dwSize = sizeof me;
+    if (Module32FirstW(snap, &me))
+    {
+        do
+        {
+            ++i;
+            char ver[48];
+            r210_file_version(me.szExePath, ver_dll, ver, sizeof ver);
+            const char *where = r210_where(me.szExePath, addon_dir, game_dir, win_dir);
+            if      (where[0] == 'g' || where[0] == 'm') ++n_game;
+            else if (where[0] == 's') ++n_sys;
+            else                      ++n_other;
+            if (r210_is_ngx(me.szModule))
+            {
+                char sha[72];
+                unsigned long long fsz = 0ull;
+                r210_file_sha256(me.szExePath, bc_dll, sha, sizeof sha, fsz);
+                snprintf(l, sizeof l, "[MGPU][R210] %u/%u %ls %s %s size=%llu sha256=%s",
+                         i, total, me.szModule, ver, where, fsz, sha);
+            }
+            else
+                snprintf(l, sizeof l, "[MGPU][R210] %u/%u %ls %s %s", i, total, me.szModule, ver, where);
+            mgpu::diag::info(l);
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    if (ver_dll != nullptr) FreeLibrary(ver_dll);
+    if (bc_dll  != nullptr) FreeLibrary(bc_dll);
+
+    snprintf(l, sizeof l,
+             "[MGPU][R210] PROCESS CENSUS AT ARM END: %u listed | game=%u system=%u other=%u",
+             i, n_game, n_sys, n_other);
+    mgpu::diag::info(l);
 }
 
 // V55. worker.cpp calls this once, at T4, with what pick_bridge_placement
