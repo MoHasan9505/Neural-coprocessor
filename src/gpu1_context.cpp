@@ -10232,13 +10232,17 @@ namespace
         // a leak, which is the same reasoning R26 states a few lines up. Two
         // seconds is longer than any frame this project has measured and
         // shorter than the TDR it is trying to avoid.
-        if (s.nfence != nullptr && s.produced != 0
-            && s.nfence->GetCompletedValue() < (UINT64)s.produced)
+        //
+        // gfence, not nfence: nfence is released a few lines above, so testing
+        // it here meant this drain never ran. gfence is the same fence on the
+        // game's side and is still alive.
+        if (s.gfence != nullptr && s.produced != 0
+            && s.gfence->GetCompletedValue() < (UINT64)s.produced)
         {
             HANDLE dev0 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             if (dev0 != nullptr)
             {
-                if (SUCCEEDED(s.nfence->SetEventOnCompletion((UINT64)s.produced, dev0)))
+                if (SUCCEEDED(s.gfence->SetEventOnCompletion((UINT64)s.produced, dev0)))
                 {
                     if (WaitForSingleObject(dev0, 2000) != WAIT_OBJECT_0)
                         mgpu::diag::warn(
